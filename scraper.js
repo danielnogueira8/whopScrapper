@@ -676,7 +676,23 @@ async function scrapeProductPage(page, productUrl) {
                     document.title.replace(' | Whop', '').trim();
       result.productName = title;
       
-      // Extract price/cost from the page
+      // Helper function to extract numeric value from price string
+      const extractNumericPrice = (priceStr) => {
+        const match = priceStr.match(/([\d,]+\.?\d*)/);
+        if (match) {
+          return parseFloat(match[1].replace(/,/g, ''));
+        }
+        return null;
+      };
+      
+      // Helper function to check if price is realistic (not too high, likely a member count or other stat)
+      const isRealisticPrice = (priceNum) => {
+        if (priceNum === null) return false;
+        // Prices above $10,000 are likely not product prices (could be member counts, etc.)
+        return priceNum > 0 && priceNum <= 10000;
+      };
+      
+      // Extract price and payment frequency together from the page
       // Strategy 1: Look for JSON-LD structured data with price
       const jsonLdScripts = document.querySelectorAll('script[type="application/ld+json"]');
       for (const script of jsonLdScripts) {
@@ -691,160 +707,203 @@ async function scrapeProductPage(page, productUrl) {
               const offers = Array.isArray(data.offers) ? data.offers : [data.offers];
               for (const offer of offers) {
                 if (offer.price) {
-                  result.price = offer.price;
-                  if (offer.priceCurrency) {
-                    result.price = `${offer.priceCurrency} ${offer.price}`;
+                  const priceNum = extractNumericPrice(String(offer.price));
+                  if (isRealisticPrice(priceNum)) {
+                    result.price = offer.price;
+                    if (offer.priceCurrency) {
+                      result.price = `${offer.priceCurrency} ${offer.price}`;
+                    }
+                    // Check for billing frequency in offer
+                    if (offer.priceSpecification?.priceType) {
+                      const priceType = offer.priceSpecification.priceType.toLowerCase();
+                      if (priceType.includes('monthly')) result.paymentFrequency = 'Monthly';
+                      else if (priceType.includes('yearly') || priceType.includes('annual')) result.paymentFrequency = 'Yearly';
+                      else result.paymentFrequency = 'One-time';
+                    }
+                    break;
                   }
-                  break;
                 }
               }
             }
             // Check for price directly on product
             if (data.price && !result.price) {
-              result.price = data.price;
+              const priceNum = extractNumericPrice(String(data.price));
+              if (isRealisticPrice(priceNum)) {
+                result.price = data.price;
+              }
             }
           }
         } catch (e) {}
       }
       
-      // Strategy 2: Look for price in common selectors
+      // Strategy 2: Look for price near Join/Buy buttons (most reliable)
       if (!result.price) {
-        // Look for elements with price-related classes/attributes
+        const joinButtons = Array.from(document.querySelectorAll('button, a[role="button"], a')).filter(btn => {
+          const btnText = btn.textContent?.toLowerCase() || '';
+          return (btnText.includes('join') || btnText.includes('buy') || btnText.includes('purchase') || 
+                  btnText.includes('subscribe') || btnText.includes('get access')) && 
+                 !btnText.includes('free') && !btnText.includes('trial');
+        });
+        
+        for (const btn of joinButtons) {
+          // Look in button text first
+          const btnText = btn.textContent || '';
+          const priceInButton = btnText.match(/\$\s*([\d,]+\.?\d*)/) || 
+                               btnText.match(/([\d,]+\.?\d*)\s*USD/i) ||
+                               btnText.match(/([\d,]+\.?\d*)\s*\/\s*(month|year|mo|yr)/i);
+          
+          if (priceInButton) {
+            const priceNum = extractNumericPrice(priceInButton[0]);
+            if (isRealisticPrice(priceNum)) {
+              result.price = priceInButton[0].trim();
+              // Check button text for frequency
+              const btnLower = btnText.toLowerCase();
+              if (btnLower.includes('/month') || btnLower.includes('per month') || btnLower.includes('monthly')) {
+                result.paymentFrequency = 'Monthly';
+              } else if (btnLower.includes('/year') || btnLower.includes('per year') || btnLower.includes('yearly') || btnLower.includes('annual')) {
+                result.paymentFrequency = 'Yearly';
+              } else if (btnLower.includes('one-time') || btnLower.includes('one time') || btnLower.includes('lifetime')) {
+                result.paymentFrequency = 'One-time';
+              }
+              break;
+            }
+          }
+          
+          // Look in parent elements near the button
+          let parent = btn.parentElement;
+          for (let i = 0; i < 6 && parent; i++) {
+            const parentText = parent.textContent || '';
+            const parentHtml = parent.innerHTML || '';
+            
+            // Look for price patterns in parent
+            const priceMatches = [
+              parentText.match(/\$\s*([\d,]+\.?\d*)\s*(?:\/|per)\s*(month|year|mo|yr)/i),
+              parentText.match(/\$\s*([\d,]+\.?\d*)/),
+              parentText.match(/([\d,]+\.?\d*)\s*USD/i),
+            ];
+            
+            for (const match of priceMatches) {
+              if (match) {
+                const priceNum = extractNumericPrice(match[0]);
+                if (isRealisticPrice(priceNum)) {
+                  result.price = match[0].trim();
+                  
+                  // Extract frequency from the same context
+                  const context = parentText.toLowerCase();
+                  if (context.includes('/month') || context.includes('per month') || context.includes('monthly') || 
+                      context.includes('mo') && !context.includes('moment')) {
+                    result.paymentFrequency = 'Monthly';
+                  } else if (context.includes('/year') || context.includes('per year') || context.includes('yearly') || 
+                             context.includes('annual') || context.includes('/yr')) {
+                    result.paymentFrequency = 'Yearly';
+                  } else if (context.includes('one-time') || context.includes('one time') || 
+                             context.includes('lifetime') || context.includes('forever') ||
+                             context.includes('pay once') || context.includes('single payment')) {
+                    result.paymentFrequency = 'One-time';
+                  } else if (context.includes('subscription') || context.includes('recurring') || 
+                             context.includes('billing')) {
+                    // Default subscription to monthly if not specified
+                    result.paymentFrequency = 'Monthly';
+                  } else {
+                    result.paymentFrequency = 'One-time';
+                  }
+                  break;
+                }
+              }
+            }
+            
+            if (result.price) break;
+            parent = parent.parentElement;
+          }
+          
+          if (result.price) break;
+        }
+      }
+      
+      // Strategy 3: Look for price in pricing-specific elements
+      if (!result.price) {
         const priceSelectors = [
           '[class*="price"]',
           '[class*="Price"]',
-          '[class*="cost"]',
-          '[class*="Cost"]',
+          '[class*="pricing"]',
+          '[class*="Pricing"]',
           '[data-price]',
           '[data-cost]',
           '[itemprop="price"]',
-          '[itemprop="priceCurrency"]',
         ];
         
         for (const selector of priceSelectors) {
           const elements = document.querySelectorAll(selector);
           for (const el of elements) {
             const text = el.textContent?.trim() || el.getAttribute('data-price') || el.getAttribute('data-cost') || '';
-            // Look for price pattern: $XX.XX or currency symbol followed by numbers
-            const priceMatch = text.match(/(\$|USD|€|£|¥)\s*([\d,]+\.?\d*)/i) || text.match(/([\d,]+\.?\d*)\s*(\$|USD|€|£|¥)/i);
+            const priceMatch = text.match(/\$\s*([\d,]+\.?\d*)/) || text.match(/([\d,]+\.?\d*)\s*USD/i);
+            
             if (priceMatch) {
-              result.price = priceMatch[0].trim();
-              break;
+              const priceNum = extractNumericPrice(priceMatch[0]);
+              if (isRealisticPrice(priceNum)) {
+                result.price = priceMatch[0].trim();
+                
+                // Check for frequency in the same element
+                const elText = text.toLowerCase();
+                if (elText.includes('/month') || elText.includes('per month') || elText.includes('monthly')) {
+                  result.paymentFrequency = 'Monthly';
+                } else if (elText.includes('/year') || elText.includes('per year') || elText.includes('yearly') || elText.includes('annual')) {
+                  result.paymentFrequency = 'Yearly';
+                } else if (elText.includes('one-time') || elText.includes('lifetime')) {
+                  result.paymentFrequency = 'One-time';
+                }
+                break;
+              }
             }
           }
           if (result.price) break;
         }
       }
       
-      // Strategy 3: Search all text for price patterns
+      // Strategy 4: Look for "Free" products
       if (!result.price) {
-        const bodyText = document.body.innerText || '';
-        // Look for common price patterns: $XX, $XX.XX, Free, etc.
-        const pricePatterns = [
-          /\$\s*([\d,]+\.?\d*)/,  // $99, $99.99
-          /([\d,]+\.?\d*)\s*USD/i,  // 99 USD
-          /([\d,]+\.?\d*)\s*per\s*(month|year|week)/i,  // 99 per month
-          /Free/i,  // Free
-        ];
-        
-        for (const pattern of pricePatterns) {
-          const match = bodyText.match(pattern);
-          if (match) {
-            // Try to find the price in context (look for "Join" button nearby)
-            const priceText = match[0];
-            // Check if it's near a "Join" or "Buy" button (likely the actual price)
-            const joinButtons = Array.from(document.querySelectorAll('button, a')).filter(btn => {
-              const btnText = btn.textContent?.toLowerCase() || '';
-              return btnText.includes('join') || btnText.includes('buy') || btnText.includes('purchase');
-            });
-            
-            for (const btn of joinButtons) {
-              // Look for price near the button
-              let parent = btn.parentElement;
-              for (let i = 0; i < 5 && parent; i++) {
-                const parentText = parent.textContent || '';
-                if (parentText.includes(priceText)) {
-                  result.price = priceText.trim();
-                  break;
-                }
-                parent = parent.parentElement;
-              }
-              if (result.price) break;
-            }
-            
-            if (!result.price) {
-              result.price = priceText.trim();
-            }
+        const freeIndicators = document.querySelectorAll('button, a, [class*="price"], [class*="Price"]');
+        for (const el of freeIndicators) {
+          const text = el.textContent?.toLowerCase() || '';
+          if ((text.includes('free') || text.includes('$0')) && 
+              (text.includes('join') || text.includes('get') || text.includes('access'))) {
+            result.price = 'Free';
+            result.paymentFrequency = 'Free';
             break;
           }
         }
       }
       
-      // Strategy 4: Look for price in button text (Join button often shows price)
-      if (!result.price) {
-        const buttons = document.querySelectorAll('button, a[role="button"]');
-        for (const btn of buttons) {
-          const btnText = btn.textContent || '';
-          // Look for price in button text
-          const priceMatch = btnText.match(/(\$|USD|€|£|¥)\s*([\d,]+\.?\d*)/i) || 
-                            btnText.match(/([\d,]+\.?\d*)\s*(\$|USD|€|£|¥)/i) ||
-                            btnText.match(/Free/i);
-          if (priceMatch && (btnText.toLowerCase().includes('join') || btnText.toLowerCase().includes('buy'))) {
-            result.price = priceMatch[0].trim();
-            break;
-          }
-        }
-      }
-      
-      // Detect payment frequency (one-time, monthly, yearly)
-      if (result.price && result.price.toLowerCase() !== 'free') {
-        const priceText = result.price.toLowerCase();
+      // Final check: if we have price but no frequency, try to infer from page context
+      if (result.price && !result.paymentFrequency && result.price.toLowerCase() !== 'free') {
         const bodyText = document.body.innerText?.toLowerCase() || '';
-        const priceContext = bodyText.substring(
-          Math.max(0, bodyText.indexOf(priceText) - 100),
-          Math.min(bodyText.length, bodyText.indexOf(priceText) + 200)
-        );
-        
-        // Check for payment frequency indicators
-        if (priceContext.includes('one-time') || priceContext.includes('one time') || 
-            priceContext.includes('lifetime') || priceContext.includes('life time') ||
-            priceContext.includes('forever') || priceContext.includes('pay once') ||
-            priceContext.includes('single payment') || priceContext.includes('one payment')) {
-          result.paymentFrequency = 'One-time';
-        } else if (priceContext.includes('monthly') || priceContext.includes('per month') || 
-                   priceContext.includes('/month') || priceContext.includes('mo') ||
-                   priceContext.includes('monthly subscription') || priceContext.includes('monthly payment')) {
-          result.paymentFrequency = 'Monthly';
-        } else if (priceContext.includes('yearly') || priceContext.includes('per year') || 
-                   priceContext.includes('/year') || priceContext.includes('annual') ||
-                   priceContext.includes('yearly subscription') || priceContext.includes('yearly payment') ||
-                   priceContext.includes('per annum')) {
-          result.paymentFrequency = 'Yearly';
-        } else if (priceText.includes('per month') || priceText.includes('/month') || priceText.includes('mo')) {
-          result.paymentFrequency = 'Monthly';
-        } else if (priceText.includes('per year') || priceText.includes('/year') || priceText.includes('annual')) {
-          result.paymentFrequency = 'Yearly';
-        } else {
-          // Default: if no frequency indicator found, assume one-time
-          // But also check if there are subscription-related keywords nearby
-          if (priceContext.includes('subscription') || priceContext.includes('recurring') || 
-              priceContext.includes('billing')) {
-            // If subscription-related but no clear frequency, check for common patterns
-            if (priceContext.includes('month')) {
-              result.paymentFrequency = 'Monthly';
-            } else if (priceContext.includes('year') || priceContext.includes('annual')) {
-              result.paymentFrequency = 'Yearly';
-            } else {
-              result.paymentFrequency = 'Unknown';
-            }
+        const priceIndex = bodyText.indexOf(result.price.toLowerCase());
+        if (priceIndex >= 0) {
+          const context = bodyText.substring(
+            Math.max(0, priceIndex - 150),
+            Math.min(bodyText.length, priceIndex + 250)
+          );
+          
+          // Prioritize monthly/yearly indicators over one-time
+          if (context.includes('monthly') || context.includes('per month') || 
+              context.includes('/month') || (context.includes('mo') && !context.includes('moment'))) {
+            result.paymentFrequency = 'Monthly';
+          } else if (context.includes('yearly') || context.includes('per year') || 
+                     context.includes('/year') || context.includes('annual')) {
+            result.paymentFrequency = 'Yearly';
+          } else if (context.includes('one-time') || context.includes('one time') || 
+                     context.includes('lifetime') || context.includes('forever') ||
+                     context.includes('pay once')) {
+            result.paymentFrequency = 'One-time';
+          } else if (context.includes('subscription') || context.includes('recurring')) {
+            // Default subscription to monthly
+            result.paymentFrequency = 'Monthly';
           } else {
             result.paymentFrequency = 'One-time';
           }
+        } else {
+          result.paymentFrequency = 'One-time';
         }
-      } else if (result.price && result.price.toLowerCase() === 'free') {
-        result.paymentFrequency = 'Free';
-      } else {
-        result.paymentFrequency = '';
       }
       
       // Extract Whop handle from profile link
