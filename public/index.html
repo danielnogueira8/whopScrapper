@@ -511,6 +511,8 @@
               <th>#</th>
               <th>Product Name</th>
               <th>Creator</th>
+              <th>Price</th>
+              <th>Payment Frequency</th>
               <th>Twitter/X</th>
               <th>Instagram</th>
               <th>YouTube</th>
@@ -639,6 +641,8 @@
         <td>${index}</td>
         <td class="product-name" title="${product.productName || ''}">${productNameCell}</td>
         <td>${product.creatorName || product.creatorHandle || '-'}</td>
+        <td>${product.price ? `<strong>${product.price}</strong>` : '<span class="no-data">-</span>'}</td>
+        <td>${product.paymentFrequency ? `<span style="font-weight: 500; color: #667eea;">${product.paymentFrequency}</span>` : '<span class="no-data">-</span>'}</td>
         <td>${product.twitter ? `<a href="${product.twitter}" target="_blank" class="social-link">Link</a>` : '<span class="no-data">-</span>'}</td>
         <td>${product.instagram ? `<a href="${product.instagram}" target="_blank" class="social-link">Link</a>` : '<span class="no-data">-</span>'}</td>
         <td>${product.youtube ? `<a href="${product.youtube}" target="_blank" class="social-link">Link</a>` : '<span class="no-data">-</span>'}</td>

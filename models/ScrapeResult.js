@@ -15,6 +15,8 @@ const scrapeResultSchema = new mongoose.Schema({
     productUrl: String,
     creatorName: String,
     creatorHandle: String,
+    price: String,
+    paymentFrequency: String,
     twitter: String,
     instagram: String,
     youtube: String,
